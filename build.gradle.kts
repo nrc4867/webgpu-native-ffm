@@ -1,64 +1,103 @@
-import dev.chieppa.stretch.build.DownloadWgpuNative
-import dev.chieppa.stretch.build.GenerateWgpuBindings
+import dev.chieppa.webgpu.build.DownloadWgpuNative
+import dev.chieppa.webgpu.build.GenerateWgpuBindings
+import dev.chieppa.webgpu.build.WgpuArchives
 
 plugins {
     `java-library`
     `maven-publish`
 }
 
+group = "dev.chieppa"
+version = providers.gradleProperty("releaseVersion").getOrElse("0.1.0-SNAPSHOT")
+
 java {
     toolchain.languageVersion.set(JavaLanguageVersion.of(libs.versions.jvmToolchain.get().toInt()))
     withSourcesJar()
 }
 
-publishing {
-    publications {
-        create<MavenPublication>("maven") { from(components["java"]) }
+val wgpuRelease: String = libs.versions.wgpu.native.get()
+
+/** The GitHub repository this library lives in and publishes to. */
+val githubRepository = "nrc4867/webgpu-native-ffm"
+
+/** Per platform: download its wgpu-native archive and pack the library, with wgpu-native's licenses, in its own jar. */
+val platforms = WgpuArchives.all.associateWith { archive ->
+    val download = tasks.register<DownloadWgpuNative>("downloadWgpuNative${archive.taskSuffix}") {
+        url = archive.url(wgpuRelease)
+        sha256 = archive.sha256
+        destination = layout.buildDirectory.dir("wgpu-native/${archive.platform}")
     }
-}
-
-/** One wgpu-native release archive for a platform, the library file in it, and where it goes in the jar. */
-data class WgpuArchive(val asset: String, val sha256: String, val library: String, val platform: String)
-
-val wgpuVersion = libs.versions.wgpu.native.get()
-val archives = listOf(
-    WgpuArchive("wgpu-windows-x86_64-msvc-release.zip", "7e67d7445c42aeb85e30f88930fd8d7d83ee769e3390aeb1ada75ebf3cf78132", "wgpu_native.dll", "windows-x64"),
-    WgpuArchive("wgpu-linux-x86_64-release.zip", "95a4d90c071005a98d03eab348beaa6b07e16eb00d1dcdb9f8348f75eb97ec5a", "libwgpu_native.so", "linux-x64"),
-    WgpuArchive("wgpu-linux-aarch64-release.zip", "015fcdf1dbae82e614a783cc38017e5399ae0927a889fe9b69c9b664bc61b47a", "libwgpu_native.so", "linux-arm64"),
-    WgpuArchive("wgpu-macos-aarch64-release.zip", "a5797a37b1adf720bcd5dcffb291edbbd5b7b14be0a3874c28e6393a655a7a3e", "libwgpu_native.dylib", "macos-arm64"),
-    WgpuArchive("wgpu-macos-x86_64-release.zip", "8e2f7378548ddd0e2cf21e7d864dda46e953f0af724855a33778b85ead206d41", "libwgpu_native.dylib", "macos-x64"),
-)
-
-/** The archive for the machine building, whose library goes in the jar. Published builds run on Windows; see publish.yml. */
-val hostArchive: WgpuArchive = run {
-    val os = System.getProperty("os.name").lowercase()
-    val arm = System.getProperty("os.arch").lowercase().let { it == "aarch64" || it == "arm64" }
-    val platform = when {
-        os.startsWith("windows") -> "windows-x64"
-        os.startsWith("mac") -> if (arm) "macos-arm64" else "macos-x64"
-        else -> if (arm) "linux-arm64" else "linux-x64"
+    val jar = tasks.register<Jar>("nativesJar${archive.taskSuffix}") {
+        group = "build"
+        description = "Packs wgpu-native for ${archive.platform}."
+        archiveClassifier = archive.classifier
+        from(download.map { it.destination.dir("lib") }) {
+            include(archive.library)
+            into(archive.resourceFolder)
+        }
+        from(layout.projectDirectory.dir("licenses")) { into("META-INF/licenses") }
     }
-    archives.first { it.platform == platform }
+    download to jar
 }
 
-val downloadWgpuNative by tasks.registering(DownloadWgpuNative::class) {
-    url = "https://github.com/gfx-rs/wgpu-native/releases/download/$wgpuVersion/${hostArchive.asset}"
-    sha256 = hostArchive.sha256
-    destination = layout.buildDirectory.dir("wgpu-native/${hostArchive.platform}")
+val nativesJars by tasks.registering {
+    group = "build"
+    description = "Packs wgpu-native for every platform."
+    dependsOn(platforms.values.map { it.second })
+}
+tasks.assemble { dependsOn(nativesJars) }
+
+dependencies {
+    testImplementation(platform(libs.junit.bom))
+    testImplementation(libs.junit.jupiter)
+    testRuntimeOnly(libs.junit.launcher)
+    // Tests load the library the way an app does: from the natives jar of the machine running them.
+    testRuntimeOnly(files(platforms.getValue(WgpuArchives.host).second))
 }
 
-tasks.processResources {
-    from(downloadWgpuNative.map { it.destination.dir("lib") }) {
-        include(hostArchive.library)
-        into("dev/chieppa/stretch/gpu/native/${hostArchive.platform}")
-    }
+tasks.test {
+    useJUnitPlatform()
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    systemProperty("wgpu.release", wgpuRelease)
 }
 
-// Regenerates src/main/java from the downloaded headers: ./gradlew :stretch-gpu-native:generateBindings -Pjextract.home=<jextract>
+// Regenerates src/main/java from the downloaded headers: ./gradlew generateBindings -Pjextract.home=<jextract>
 tasks.register<GenerateWgpuBindings>("generateBindings") {
+    group = "build"
     jextractHome = providers.gradleProperty("jextract.home")
-    headers = downloadWgpuNative.flatMap { it.destination.dir("include") }
+    headers = platforms.getValue(WgpuArchives.host).first.flatMap { it.destination.dir("include") }
     includes = layout.projectDirectory.file("bindings.includes")
-    targetPackage = "dev.chieppa.stretch.gpu.ffi"
+    targetPackage = "dev.chieppa.webgpu.ffi"
     output = layout.projectDirectory.dir("src/main/java")
+}
+
+// Publishes to GitHub Packages in the repository named by GITHUB_REPOSITORY (set by Actions). Credentials come from
+// ORG_GRADLE_PROJECT_GitHubPackagesUsername and ORG_GRADLE_PROJECT_GitHubPackagesPassword.
+publishing {
+    repositories {
+        maven {
+            name = "GitHubPackages"
+            url = uri("https://maven.pkg.github.com/${providers.environmentVariable("GITHUB_REPOSITORY").getOrElse(githubRepository)}")
+            credentials(PasswordCredentials::class)
+        }
+    }
+    publications {
+        create<MavenPublication>("maven") {
+            from(components["java"])
+            platforms.values.forEach { artifact(it.second) }
+            pom {
+                name = rootProject.name
+                description = "Java bindings for wgpu-native over the Foreign Function & Memory API, with the " +
+                    "native library in a jar per platform. Bundles wgpu-native $wgpuRelease."
+                url = "https://github.com/$githubRepository"
+                licenses {
+                    license {
+                        name = "MIT"
+                        url = "https://opensource.org/license/mit"
+                    }
+                }
+                scm { url = "https://github.com/$githubRepository" }
+            }
+        }
+    }
 }
