@@ -55,5 +55,17 @@ abstract class GenerateWgpuBindings : DefaultTask() {
             .start()
         val log = process.inputStream.bufferedReader().readText()
         if (process.waitFor() != 0) throw GradleException("jextract failed:\n$log")
+        makeLongPortable(root.resolve(targetPackage.get().replace('.', '/')).resolve("wgpu_h\$shared.java"))
+    }
+
+    /**
+     * jextract types `C_LONG` for the machine it runs on: an int on Windows, a long elsewhere, so the class fails to
+     * initialise on the other kind. wgpu.h uses no C `long`, so it is typed as any value layout instead.
+     */
+    private fun makeLongPortable(shared: File) {
+        val declaration = Regex("""public static final ValueLayout\.Of\w+ C_LONG = \(ValueLayout\.Of\w+\) """)
+        val text = shared.readText()
+        if (!declaration.containsMatchIn(text)) throw GradleException("No C_LONG declaration in $shared")
+        shared.writeText(text.replace(declaration, "public static final ValueLayout C_LONG = (ValueLayout) "))
     }
 }
